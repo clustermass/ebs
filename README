@@ -227,12 +227,6 @@ capacity, failure cleanup, and preservation of the previous stable backup.
 Never publish a deployment's `config.json`, configuration backups, logs, runtime
 state, or locally installed VMware OVF Tool. They are covered by `.gitignore`.
 
-This project's earlier Git history contained real deployment configuration and
-proprietary OVF Tool copies. Deleting them in a later commit does not remove
-them from earlier commits. Do not make that existing history public. Publish a
-fresh-history copy of the cleaned working tree, or carefully rewrite and audit
-the complete history first. Rotate every credential that was ever committed.
-
 VMware OVF Tool remains governed by VMware/Broadcom's separate license and must
 not be added to this repository.
 
