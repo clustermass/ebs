@@ -11,9 +11,9 @@ It is intended for standalone or lightly managed ESXi hosts where temporary VM
 downtime is acceptable and a straightforward NAS-backed workflow is preferable
 to a larger commercial backup platform.
 
-See [INSTALLATION](INSTALLATION) for the tested deployment walkthrough and
-[DESCRIPTION](DESCRIPTION) for architecture, file responsibilities, and review
-notes.
+See [INSTALLATION.md](INSTALLATION.md) for the tested deployment walkthrough and
+[DESCRIPTION.md](DESCRIPTION.md) for architecture, file responsibilities, and
+review notes.
 
 ## Limitations
 
@@ -32,7 +32,7 @@ notes.
 - `report_error.sh` is a placeholder. There are no built-in email, webhook, or
   centralized monitoring notifications.
 - Compatibility has been tested with specific ESXi, DSM, and OVF Tool versions
-  documented in `INSTALLATION`; other versions require validation.
+  documented in `INSTALLATION.md`; other versions require validation.
 - Restoration must be tested independently. A completed export is not proof of
   a recoverable backup.
 
