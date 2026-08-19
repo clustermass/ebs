@@ -1,11 +1,40 @@
 # EBS — ESXi Backup Service
 
-EBS is a Bash service that exports VMware ESXi virtual machines to SMB/CIFS
-storage, primarily a Synology NAS. It schedules backups, manages NAS power,
-stops and restores VMs, and preserves the previous backup until its replacement
-has completed successfully.
+> A lightweight, offline ESXi-to-Synology OVF backup service for homelabs and
+> small environments.
 
-See `DESCRIPTION` for the architecture, file responsibilities, and review notes.
+EBS is a Bash service that exports VMware ESXi virtual machines to SMB/CIFS
+storage. It schedules full backups, manages Synology NAS power, safely stops and
+restores VMs, and preserves the previous backup until its replacement succeeds.
+
+It is intended for standalone or lightly managed ESXi hosts where temporary VM
+downtime is acceptable and a straightforward NAS-backed workflow is preferable
+to a larger commercial backup platform.
+
+See [INSTALLATION](INSTALLATION) for the tested deployment walkthrough and
+[DESCRIPTION](DESCRIPTION) for architecture, file responsibilities, and review
+notes.
+
+## Limitations
+
+- Backups require VM downtime; EBS powers down running VMs during export.
+- Backups are complete OVF exports, not incremental or snapshot-based backups.
+- ESXi and NAS credentials are stored locally in plaintext `config.json`. The
+  file is ignored by Git and should remain restricted to mode `600`.
+- VM discovery uses command-output parsing and substring matching. Avoid spaces,
+  brackets, unusual encodings, and overlapping names such as `Test` and `Test2`.
+- The scheduler requires an exact local-time `HH:MM` match. Downtime during that
+  minute causes the day's trigger to be missed.
+- A failed VM is excluded until an operator investigates and removes its error
+  file; there is no automatic retry policy.
+- A suspended VM skipped with `suppressErrorIfSuspended: "y"` is currently
+  recorded as successful even though no export was created.
+- `report_error.sh` is a placeholder. There are no built-in email, webhook, or
+  centralized monitoring notifications.
+- Compatibility has been tested with specific ESXi, DSM, and OVF Tool versions
+  documented in `INSTALLATION`; other versions require validation.
+- Restoration must be tested independently. A completed export is not proof of
+  a recoverable backup.
 
 ## Capabilities
 
@@ -203,24 +232,13 @@ There is currently no automatic retry or expiry for excluded machines.
 - `bin/jq-linux64` — active bundled `jq` executable.
 - `bin/ovftool/` — ignored location for a locally installed VMware OVF Tool.
 
-## Operational cautions
-
-- Backups intentionally power down running VMs. Test on a disposable VM first.
-- Avoid spaces, brackets, unusual encodings, and overlapping names such as
-  `Test` and `Test2`; current VM lookup parses output and uses substring matching.
-- The scheduler checks for an exact `HH:MM` match. Downtime during that minute
-  causes the day's trigger to be missed.
-- A suspended VM skipped with `suppressErrorIfSuspended` is currently recorded
-  as successful even though no export was made.
-- `report_error.sh` sends no alerts; monitor the journal, log, and exclusions.
-- Backup promotion recursively removes directories. Review every configured
-  mount and temporary-storage path carefully.
-
 ## Production validation
 
 Use a disposable VM and share to confirm host-key verification, unattended CIFS
 mounting, NAS wake/shutdown, successful OVF restoration, VM restart, available
 capacity, failure cleanup, and preservation of the previous stable backup.
+Backup promotion recursively removes staging and previous-backup directories,
+so review every configured mount and temporary-storage path carefully.
 
 ## Publishing safely
 
