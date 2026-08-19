@@ -1,0 +1,20 @@
+# Deployment-specific configuration and backups contain credentials.
+config.json
+config.json.backup.*
+
+# VMware OVF Tool is proprietary and must be installed locally under its EULA.
+bin/ovftool/
+
+# Runtime state and logs.
+*.log
+*.err
+debug.log
+temp_process_machine.log
+excluded_machines/
+processed_machines/
+mount/
+
+# Local cache or editor artifacts.
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,22 @@
+[Unit]
+Description=ESXi Backup Service (EBS)
+After=network-online.target local-fs.target
+Wants=network-online.target
+@CACHE_MOUNT_REQUIREMENT@
+
+[Service]
+Type=simple
+User=@EBS_USER@
+Group=@EBS_GROUP@
+WorkingDirectory=@EBS_PROJECT_DIR@
+ExecStart=@EBS_PROJECT_DIR@/ebs.sh
+Environment="EBS_HOME=@EBS_PROJECT_DIR@"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+UMask=0077
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

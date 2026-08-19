@@ -1,0 +1,47 @@
+{
+  "commonConfig": {
+    "prefferedBackupStartTime": "22:30",
+    "tempBackupStoragePath": "/mnt/ebs-cache/backups"
+  },
+  "machines": [
+    {
+      "name": "ExampleVM",
+      "backupPeriod": 24,
+      "esxiServer": "esxi-01",
+      "dataStoreName": "datastore1",
+      "backupServer": "nas-01-share-01",
+      "useTempBackupStorage": "y",
+      "suppressErrorIfSuspended": "n"
+    }
+  ],
+  "esxiServers": [
+    {
+      "name": "esxi-01",
+      "ip": "192.0.2.10",
+      "login": "CHANGE_ME",
+      "password": "CHANGE_ME",
+      "esxiHostKey": "SHA256:RUN_THE_HOST_KEY_SETUP_HELPER"
+    },
+    {
+      "name": "esxi-02",
+      "ip": "192.0.2.11",
+      "login": "CHANGE_ME",
+      "password": "CHANGE_ME",
+      "esxiHostKey": "SHA256:RUN_THE_HOST_KEY_SETUP_HELPER"
+    }
+  ],
+  "backupServers": [
+    {
+      "name": "nas-01-share-01",
+      "ip": "192.0.2.20",
+      "login": "CHANGE_ME",
+      "password": "CHANGE_ME",
+      "sharePath": "vm_backups",
+      "mac": "02:00:00:00:00:20",
+      "broadcastIp": "192.0.2.255",
+      "powerOff": "y",
+      "powerOn": "y",
+      "notes": "Replace all example values before running EBS"
+    }
+  ]
+}

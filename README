@@ -1,0 +1,245 @@
+# EBS — ESXi Backup Service
+
+EBS is a Bash service that exports VMware ESXi virtual machines to SMB/CIFS
+storage, primarily a Synology NAS. It schedules backups, manages NAS power,
+stops and restores VMs, and preserves the previous backup until its replacement
+has completed successfully.
+
+See `DESCRIPTION` for the architecture, file responsibilities, and review notes.
+
+## Capabilities
+
+- Schedule backups at a preferred daily start time.
+- Give each VM an independent backup interval, in hours.
+- Manage multiple ESXi hosts and NAS shares from one configuration.
+- Wake and optionally shut down Synology NAS devices.
+- Mount CIFS destinations only while they are needed.
+- Gracefully stop VMs, with a hard power-off fallback when VMware Tools fails.
+- Export complete VMs in OVF format with a locally installed VMware OVF Tool.
+- Stage exports locally or directly on the NAS.
+- Restore a VM to its original powered-on state.
+- Keep the last stable backup if export or VM restart fails.
+- Record successful and failed backup history.
+
+## Backup lifecycle
+
+At the configured start minute, `ebs.sh` finds machines whose `backupPeriod` has
+elapsed and processes them sequentially:
+
+1. Confirm that the ESXi host is reachable.
+2. Wake the configured NAS when `powerOn` is enabled.
+3. Mount its CIFS share at `mount/backupDestination`.
+4. Find the VM and record its initial power state.
+5. Stop the VM if it is running.
+6. Export it to a staging directory named `___VM_NAME`.
+7. Move local staging data to the NAS when temporary storage is enabled.
+8. Restart the VM if it was originally running.
+9. Replace `VM_NAME` with the completed staging directory.
+10. Record the result, unmount the share, and continue.
+
+The old stable backup is removed only after the new export exists and a VM that
+was originally running has restarted successfully.
+
+## Requirements
+
+EBS targets Linux with Bash and systemd. It uses:
+
+- Bundled `jq` (`bin/jq-linux64`)
+- VMware OVF Tool, installed separately under VMware/Broadcom's license
+- `plink` from `putty-tools`
+- OpenSSH (`ssh`, `ssh-keyscan`, and `ssh-keygen`)
+- `sshpass` and `wakeonlan`
+- `mount.cifs`, `mountpoint`, and `umount`
+- `ping`, `timeout`, `ex`, `awk`, and standard GNU utilities
+
+The service account must be able to mount and unmount CIFS shares without an
+interactive prompt. Grant only narrowly scoped sudo permissions for this.
+
+## Configuration
+
+Copy the tracked, credential-free example to create the active configuration:
+
+```bash
+cp config.example.json config.json
+chmod 600 config.json
+```
+
+Then edit `config.json` for the deployment. Its structure is:
+
+```json
+{
+  "commonConfig": {
+    "prefferedBackupStartTime": "22:35",
+    "tempBackupStoragePath": "/srv/ebs-staging"
+  },
+  "machines": [
+    {
+      "name": "ExampleVM",
+      "backupPeriod": 24,
+      "esxiServer": "esxi-1",
+      "dataStoreName": "Datastore",
+      "backupServer": "nas-share-1",
+      "useTempBackupStorage": "y",
+      "suppressErrorIfSuspended": "n"
+    }
+  ],
+  "esxiServers": [
+    {
+      "name": "esxi-1",
+      "ip": "192.0.2.10",
+      "login": "backup-user",
+      "password": "REPLACE_ME",
+      "esxiHostKey": "SHA256:REPLACE_ME"
+    }
+  ],
+  "backupServers": [
+    {
+      "name": "nas-share-1",
+      "ip": "192.0.2.20",
+      "login": "backup-user",
+      "password": "REPLACE_ME",
+      "sharePath": "backups",
+      "mac": "00:11:22:33:44:55",
+      "broadcastIp": "192.0.2.255",
+      "powerOff": "y",
+      "powerOn": "y"
+    }
+  ]
+}
+```
+
+Configuration notes:
+
+- `prefferedBackupStartTime` is intentionally spelled this way in the code. It
+  is an `HH:MM` value in the server's local time.
+- `backupPeriod` is measured in hours.
+- `esxiServer` and `backupServer` refer to matching `name` fields.
+- `useTempBackupStorage: "y"` exports locally before moving to the NAS. The
+  temporary path needs space for a complete VM.
+- `suppressErrorIfSuspended: "y"` silently skips suspended VMs.
+- Multiple logical shares may use one NAS IP; shutdown is deduplicated by IP.
+- Generate one `esxiHostKey` with
+  `./setup_utils/get_server_signature.sh ESXI_HOST`. Verify the
+  fingerprint through a trusted channel before saving it.
+
+`config.json` stores plaintext credentials and is ignored by Git. Restrict it to
+the service user (normally mode `600`), never publish it, and rotate exposed
+credentials.
+
+## Installation
+
+1. Install the required system packages.
+2. Copy EBS into the intended service directory, such as `/home/ebs/service`.
+3. Create the `ebs` service user and group if needed.
+4. Copy `config.example.json` to `config.json`, then edit and secure it.
+5. Make the required files executable:
+
+   ```bash
+   bash setup_utils/setup_permissions.sh
+   ```
+
+6. Install VMware OVF Tool either at `bin/ovftool/ovftool` or on `PATH`, and
+   confirm that it runs on the target host.
+7. Install the path-aware systemd unit and scoped CIFS permissions, then start
+   the service:
+
+   ```bash
+   bash setup_utils/install_systemd_service.sh
+   sudo systemctl start ebs.service
+   ```
+
+8. Monitor it:
+
+   ```bash
+   systemctl status ebs.service
+   journalctl -u ebs.service -f
+   tail -f ebs.log
+   ```
+
+EBS reads `config.json` relative to its working directory. Bundled executable
+paths are resolved from the EBS installation directory.
+
+## Runtime state and recovery
+
+- `processed_machines/VM_NAME.log` begins with the epoch time of the latest
+  successful backup. This timestamp drives scheduling.
+- `excluded_machines/VM_NAME.err` records a failure and prevents that VM from
+  being scheduled again.
+- `ebs.log` contains coordinator activity.
+- `temp_process_machine.log` temporarily carries detailed worker output.
+- `mount/backupDestination` is the transient CIFS mount point.
+
+After correcting a failure, explicitly re-enable that VM by removing only its
+error file:
+
+```bash
+rm excluded_machines/VM_NAME.err
+```
+
+There is currently no automatic retry or expiry for excluded machines.
+
+## File map
+
+- `ebs.sh` — scheduler and coordinator.
+- `process_machine.sh` — VM shutdown, OVF export, restore, and promotion.
+- `mount_share.sh` / `unmount_share.sh` — active CIFS handling.
+- `power_on_synology.sh` / `power_off_synology.sh` — NAS power management.
+- `setup_utils/get_server_signature.sh` — obtains one fingerprint for `plink`.
+- `setup_utils/update_esxi_host_keys.sh` — verifies and saves fingerprints for
+  all configured ESXi servers.
+- `setup_utils/test_backup_servers.sh` — validates mount, write, delete, and
+  unmount access for every configured backup share.
+- `setup_utils/check_dependencies.sh` — checks commands required by EBS.
+- `setup_utils/test_esxi_servers.sh` — performs read-only pinned-key connection
+  tests against every configured ESXi host.
+- `setup_utils/test_nas_power.sh` — interactively power-cycles each unique NAS
+  and attempts Wake-on-LAN recovery if interrupted.
+- `report_error.sh` — placeholder error reporter.
+- `setup_utils/setup_permissions.sh` — marks active scripts and tools executable.
+- `setup_utils/ebs.service.template` — path-aware systemd unit template.
+- `setup_utils/install_systemd_service.sh` — installs the rendered unit and
+  scoped noninteractive CIFS permissions.
+- `config.example.json` — credential-free deployment configuration template.
+- `bin/jq-linux64` — active bundled `jq` executable.
+- `bin/ovftool/` — ignored location for a locally installed VMware OVF Tool.
+
+## Operational cautions
+
+- Backups intentionally power down running VMs. Test on a disposable VM first.
+- Avoid spaces, brackets, unusual encodings, and overlapping names such as
+  `Test` and `Test2`; current VM lookup parses output and uses substring matching.
+- The scheduler checks for an exact `HH:MM` match. Downtime during that minute
+  causes the day's trigger to be missed.
+- A suspended VM skipped with `suppressErrorIfSuspended` is currently recorded
+  as successful even though no export was made.
+- `report_error.sh` sends no alerts; monitor the journal, log, and exclusions.
+- Backup promotion recursively removes directories. Review every configured
+  mount and temporary-storage path carefully.
+
+## Production validation
+
+Use a disposable VM and share to confirm host-key verification, unattended CIFS
+mounting, NAS wake/shutdown, successful OVF restoration, VM restart, available
+capacity, failure cleanup, and preservation of the previous stable backup.
+
+## Publishing safely
+
+Never publish a deployment's `config.json`, configuration backups, logs, runtime
+state, or locally installed VMware OVF Tool. They are covered by `.gitignore`.
+
+This project's earlier Git history contained real deployment configuration and
+proprietary OVF Tool copies. Deleting them in a later commit does not remove
+them from earlier commits. Do not make that existing history public. Publish a
+fresh-history copy of the cleaned working tree, or carefully rewrite and audit
+the complete history first. Rotate every credential that was ever committed.
+
+VMware OVF Tool remains governed by VMware/Broadcom's separate license and must
+not be added to this repository.
+
+## License
+
+EBS is licensed under the [GNU General Public License version 3](LICENSE)
+(`GPL-3.0-only`). Commercial use is permitted. Anyone who conveys modified or
+unmodified covered copies must comply with GPLv3, including its corresponding
+source and license requirements. Private use without conveying copies does not
+require publication. VMware OVF Tool is not part of EBS and has its own license.
