@@ -32,13 +32,8 @@ esac
 
 [ -f "$TEMPLATE_FILE" ] || fail "service template not found: $TEMPLATE_FILE"
 [ -x "$PROJECT_DIR/ebs.sh" ] || fail "ebs.sh is not executable; run setup_permissions.sh first"
-[ -f "$PROJECT_DIR/config.json" ] || \
-  fail "config.json not found; copy config.example.json to config.json and edit it"
+[ -f "$PROJECT_DIR/config.json" ] || fail "config.json not found in $PROJECT_DIR"
 [ -x "$PROJECT_DIR/bin/jq-linux64" ] || fail "bundled jq is not executable"
-if [ ! -x "$PROJECT_DIR/bin/ovftool/ovftool" ] && \
-   ! command -v ovftool >/dev/null 2>&1; then
-  fail "VMware OVF Tool is not installed locally or available on PATH"
-fi
 command -v sudo >/dev/null 2>&1 || fail "sudo is required"
 command -v systemctl >/dev/null 2>&1 || fail "systemctl is required"
 command -v visudo >/dev/null 2>&1 || fail "visudo is required; install sudo"

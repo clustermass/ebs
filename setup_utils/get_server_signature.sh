@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: ./setup_utils/get_server_signature.sh 192.0.2.10
+# Usage: ./setup_utils/get_server_signature.sh 192.168.1.101
 # Displays SHA256 fingerprint SSH-host (ESXi) with correct formating, required by plink -hostkey
 
 set -e
@@ -42,7 +42,7 @@ fi
 
 # Calculating fingerprint
 FINGERPRINT_LINE="$(echo "$KEY_LINE" | ssh-keygen -lf -)"
-# Ex: "256 SHA256:EXAMPLE_FINGERPRINT hostname (ED25519)"
+# Ex: "256 SHA256:wOAjuVvd7F... hostname (ED25519)"
 
 echo
 echo "Raw ssh-keygen output:"

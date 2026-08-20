@@ -390,6 +390,8 @@ The installer:
 - Restricts `config.json` to mode `600`.
 - Adds `RequiresMountsFor` when any VM uses local cache storage.
 - Installs `/etc/systemd/system/ebs.service`.
+- Uses `process.lock` to prevent overlapping service, immediate, and manual
+  backup runs; systemd removes the lock after the service stops.
 - Installs `/etc/sudoers.d/ebs` after checking it with `visudo`.
 - Reloads systemd and enables EBS at boot, but does not start it immediately.
 
@@ -417,6 +419,11 @@ sudo systemctl stop ebs.service
 sudo systemctl restart ebs.service
 sudo systemctl disable ebs.service
 ```
+
+Stop the service before running `./ebs.sh --run-now` or `./ebs.sh -m`; the
+active service owns `process.lock` for its entire lifetime. Restart it after the
+one-shot run finishes. See the **Running backups** section in `README.md` for
+the behavior of both modes.
 
 Rerun the installer whenever the repository is moved or the service user
 changes, so its rendered paths and permissions remain correct.

@@ -6,26 +6,28 @@ ESXI_SERVER_DATA="$2"
 CURRENT_MOUNT_PATH="$3"
 TEMP_BACKUP_STORAGE_PATH="$4"
 DIR="$5"
+OUTPUT_MODE="${6:-file}"
 
 # Resolve bundled tools from the EBS installation directory supplied by ebs.sh.
 JQ_BIN="$DIR/bin/jq-linux64"
-if [ -x "$DIR/bin/ovftool/ovftool" ]; then
-  OVFTOOL_BIN="$DIR/bin/ovftool/ovftool"
-elif command -v ovftool >/dev/null 2>&1; then
-  OVFTOOL_BIN=$(command -v ovftool)
-else
-  echo "Error: VMware OVF Tool is not installed." >&2
-  exit 1
-fi
+OVFTOOL_BIN="$DIR/bin/ovftool/ovftool"
 
 jq() {
   "$JQ_BIN" "$@"
 }
 
+# config=$(<test_config.json)
+# CURR_MACHINE_DATA=$(echo $config | jq -c ".machine")
+# ESXI_SERVER_DATA=$(echo $config | jq -c ".esxiServer")
+# CURRENT_MOUNT_PATH="/home/mm/Documents/ebs/mount/backupDestination"
+# TEMP_BACKUP_STORAGE_PATH="/home/mm/backup"
+# DIR="/home/mm/Documents/ebs"
+
 # possiblePowerStates:
 POWERED_OFF="Powered off"
 POWERED_ON="Powered on"
 SUSPENDED="Suspended"
+BACKUP_SKIPPED=2
 
 
 # --- ESXi connection details ---
@@ -39,9 +41,17 @@ esxiHostKey=$(echo "$ESXI_SERVER_DATA" | jq -r ".esxiHostKey")
 machineId=""
 currentMachinePowerState=""
 initialMachinePowerState=""
+powerRestoreAttempted=0
 
 tempLog() {
-  echo "$(date) $1" >> "$DIR/temp_process_machine.log"
+  if [ "$OUTPUT_MODE" = "console" ]; then
+    # Several helpers return data through command substitution. Keep live
+    # diagnostics on stderr so they remain visible without contaminating the
+    # helper's stdout return value (for example, a numeric VM ID).
+    printf '%s %s\n' "$(date)" "$1" >&2
+  else
+    printf '%s %s\n' "$(date)" "$1" >> "$DIR/temp_process_machine.log"
+  fi
 }
 
 tempLog "Starting process_machine.sh script..."
@@ -57,13 +67,13 @@ tempLog "useTempBackupStorage flag is set to $useTempBackupStorage"
 tempLog "Temporary backup storage path is set to $TEMP_BACKUP_STORAGE_PATH"
 tempLog "suppressErrorIfSuspended flag is set to $suppressErrorIfSuspended"
 
-# --- Helper to run ESXi commands via plink with hostkey + auto-Return ---
+# --- Helper to run noninteractive ESXi commands through the pinned host key ---
 esxi_cmd() {
-  printf '\n' | plink -ssh \
+  plink -ssh -batch \
     -hostkey "$esxiHostKey" \
     -pw "$esxiPassword" \
     "$esxiLogin@$esxiIpAddress" \
-    "$@"
+    "$@" </dev/null
 }
 
 getMachineIdByName() {
@@ -72,9 +82,15 @@ getMachineIdByName() {
   local machine=""
   local machineId=""
 
-  local commandOutput
-  commandOutput=$(esxi_cmd "vim-cmd vmsvc/getallvms")
+  local commandOutput commandResult
+  commandOutput=$(esxi_cmd "vim-cmd vmsvc/getallvms" 2>&1)
+  commandResult=$?
   tempLog "getMachineIdByName command output ${commandOutput}"
+
+  if [ "$commandResult" -ne 0 ]; then
+    tempLog "getMachineIdByName ESXi command failed with exit code $commandResult"
+    return 1
+  fi
 
   # Keep only lines after 'Annotation' and parse "id:name"
   local allMachines
@@ -103,10 +119,16 @@ getMachineStatusById() {
   local possiblePowerState=("$POWERED_ON" "$POWERED_OFF" "$SUSPENDED")
   local machineId="$1"
   local currentMachinePowerState=""
-  local commandOutput
+  local commandOutput commandResult
 
-  commandOutput=$(esxi_cmd "vim-cmd vmsvc/power.getstate $machineId")
+  commandOutput=$(esxi_cmd "vim-cmd vmsvc/power.getstate $machineId" 2>&1)
+  commandResult=$?
   tempLog "getMachineStatusById command output ${commandOutput}"
+
+  if [ "$commandResult" -ne 0 ]; then
+    tempLog "getMachineStatusById ESXi command failed with exit code $commandResult"
+    return 1
+  fi
 
   for powerState in "${possiblePowerState[@]}"; do
     local machineState
@@ -284,13 +306,40 @@ fi
 
 tempLog "VM power state from esxi server for VM ID $machineId appears to be ${currentMachinePowerState}"
 
+# Once the original state is known, any later error or interruption must try to
+# return a VM that started powered on to that state. This protects failures in
+# ovftool, staging, promotion, and other paths added in the future.
+restore_original_power_state_on_exit() {
+  local exitCode=$?
+  trap - EXIT INT TERM
+
+  if [ "$exitCode" -ne 0 ] && \
+     [ "$initialMachinePowerState" == "$POWERED_ON" ] && \
+     [ "$powerRestoreAttempted" -eq 0 ]; then
+    powerRestoreAttempted=1
+    tempLog "Backup is exiting with code $exitCode. Attempting to restore VM $machineId to '$POWERED_ON'."
+    if powerUpMachineById "$machineId"; then
+      tempLog "VM $machineId was restored to '$POWERED_ON' after the backup failure."
+    else
+      tempLog "CRITICAL: VM $machineId could not be restored to '$POWERED_ON' after the backup failure."
+    fi
+  fi
+
+  exit "$exitCode"
+}
+
+trap restore_original_power_state_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # --- SUSPENDED handling ---
 if [ "$currentMachinePowerState" == "$SUSPENDED" ]; then
   if [ "$suppressErrorIfSuspended" == "y" ]; then
     tempLog "VM state is ${currentMachinePowerState}, and suppressErrorIfSuspended='y' -> silently skipping backup."
-    tempLog "Cleaning up work directory '$workBackupDir' and terminating process_machine.sh with 0."
+    tempLog "The previous successful-backup timestamp will remain unchanged so this VM stays due."
+    tempLog "Cleaning up work directory '$workBackupDir' and terminating process_machine.sh as skipped."
     rm -rf "$workBackupDir"
-    exit 0
+    exit "$BACKUP_SKIPPED"
   else
     tempLog "VM state is ${currentMachinePowerState}, suppressErrorIfSuspended!='y' -> aborting backup with error."
     tempLog "Cleaning up work directory '$workBackupDir' and terminating process_machine.sh with 1."
@@ -375,6 +424,7 @@ fi
 if [ "$initialMachinePowerState" == "$POWERED_ON" ]; then
   tempLog "Initial VM power state was '$initialMachinePowerState'. Attempting to power VM $machineId back on..."
 
+  powerRestoreAttempted=1
   if ! powerUpMachineById "$machineId"; then
     tempLog "VM $machineId failed to return to state '$POWERED_ON' after backup."
     tempLog "This indicates a possible corruption/problem. We will NOT overwrite existing stable backup at '$finalDir'."

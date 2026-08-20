@@ -3,9 +3,6 @@
 
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 required_commands=(
   awk
   base64
@@ -36,15 +33,6 @@ for command_name in "${required_commands[@]}"; do
     missing_count=$((missing_count + 1))
   fi
 done
-
-if [ -x "$PROJECT_DIR/bin/ovftool/ovftool" ]; then
-  printf '  OK      %s\n' "ovftool (local bin/ovftool)"
-elif command -v ovftool >/dev/null 2>&1; then
-  printf '  OK      %s\n' "ovftool (PATH)"
-else
-  printf '  MISSING %s\n' "ovftool"
-  missing_count=$((missing_count + 1))
-fi
 
 echo
 if [ "$missing_count" -ne 0 ]; then

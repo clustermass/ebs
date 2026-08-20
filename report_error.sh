@@ -2,4 +2,4 @@
 # pass machine name, log
 echo "Reporting failing machine backup"
 echo "$1"
-echo "$2" 
+printf '%b\n' "$2"

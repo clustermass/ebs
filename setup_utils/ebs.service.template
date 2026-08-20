@@ -10,6 +10,7 @@ User=@EBS_USER@
 Group=@EBS_GROUP@
 WorkingDirectory=@EBS_PROJECT_DIR@
 ExecStart=@EBS_PROJECT_DIR@/ebs.sh
+ExecStopPost=/usr/bin/rm -f @EBS_PROJECT_DIR@/process.lock
 Environment="EBS_HOME=@EBS_PROJECT_DIR@"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 UMask=0077

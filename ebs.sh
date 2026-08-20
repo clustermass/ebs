@@ -15,16 +15,104 @@ while [ -L "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symli
 done
 DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
 
+RUN_MODE="service"
+OUTPUT_MODE="file"
+LOCK_FILE="$DIR/process.lock"
+LOCK_OWNED=0
+
+usage() {
+    cat <<'EOF'
+Usage: ./ebs.sh [OPTION]
+
+Without an option, EBS runs continuously and waits for the configured time.
+
+  -n, --run-now  Immediately process every VM currently due for backup, then exit.
+  -m, --manual   Select VMs interactively, process them immediately, and stream
+                 coordinator and machine output to the terminal.
+  -h, --help     Show this help.
+EOF
+}
+
+if [ "$#" -gt 1 ]; then
+    usage >&2
+    exit 2
+fi
+
+case "${1:-}" in
+    "") ;;
+    -n|--run-now) RUN_MODE="run-now" ;;
+    -m|--manual)
+        RUN_MODE="manual"
+        OUTPUT_MODE="console"
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+release_lock() {
+    if [ "$LOCK_OWNED" -eq 1 ] && [ -f "$LOCK_FILE" ]; then
+        local lock_pid
+        read -r lock_pid _ < "$LOCK_FILE" || true
+        if [ "$lock_pid" = "$$" ]; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+}
+
+acquire_lock() {
+    local existing_pid existing_epoch existing_mode
+
+    if [ -f "$LOCK_FILE" ]; then
+        read -r existing_pid existing_epoch existing_mode < "$LOCK_FILE" || true
+        if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" 2>/dev/null; then
+            echo "Another EBS instance is already running (PID $existing_pid, mode ${existing_mode:-unknown})." >&2
+            echo "Stop ebs.service before running EBS manually." >&2
+            exit 1
+        fi
+        echo "Removing stale EBS lock left by PID ${existing_pid:-unknown}." >&2
+        rm -f "$LOCK_FILE"
+    fi
+
+    if ( set -o noclobber; printf '%s %s %s\n' "$$" "$(date +%s)" "$RUN_MODE" > "$LOCK_FILE" ) 2>/dev/null; then
+        LOCK_OWNED=1
+        trap release_lock EXIT
+        trap 'exit 130' INT
+        # systemd uses SIGTERM for a normal requested stop. Exit successfully
+        # so the unit becomes inactive instead of entering the failed state;
+        # the EXIT trap still releases process.lock.
+        trap 'exit 0' TERM
+    else
+        echo "Another EBS instance acquired $LOCK_FILE. Exiting." >&2
+        exit 1
+    fi
+}
+
+acquire_lock
+
 # Use the jq binary bundled with EBS instead of relying on the system PATH.
 jq() {
     "$DIR/bin/jq-linux64" "$@"
 }
 
 log() {
-    echo $(date)  "$1" >> $DIR/ebs.log
+    if [ "$OUTPUT_MODE" = "console" ]; then
+        printf '%s %s\n' "$(date)" "$1"
+    else
+        printf '%s %s\n' "$(date)" "$1" >> "$DIR/ebs.log"
+    fi
 }
 
 MAIN_LOOP_REFRESH_INTERVAL=5
+BACKUP_SKIPPED=2
+CIFS_MOUNT_ATTEMPTS=5
+CIFS_MOUNT_RETRY_INTERVAL=30
 
 MOUNT_SHARE_FOLDER_NAME="backupDestination"
 
@@ -33,15 +121,16 @@ mkdir -p $DIR/excluded_machines
 mkdir -p $DIR/processed_machines
 mkdir -p $DIR/mount
 
- for possibleShareMounted in "$DIR/mount"/*
-    do 
-       if [ -d "$possibleShareMounted" ]; then
-                sudo -n umount -f "$possibleShareMounted"
-                rmdir "$possibleShareMounted"
-       fi
-    done
+for possibleShareMounted in "$DIR/mount"/*; do
+    if mountpoint -q "$possibleShareMounted"; then
+        sudo -n umount -f "$possibleShareMounted"
+    fi
+    if [ -d "$possibleShareMounted" ]; then
+        rmdir "$possibleShareMounted" 2>/dev/null || true
+    fi
+done
 
-config=$(<config.json)
+config=$(<"$DIR/config.json")
 machines=()
 esxiServers=()
 backupServers=()
@@ -386,33 +475,43 @@ remove_machine_from_pending_backups_array_by_idx () {
 
 process_machine_backup_by_name () {
     local currMachineName="$1"
-    log "Backup for "$currMachineName" started"
-    rm -f "$DIR/temp_process_machine.log"
-    local currMachineName="$1"
+    log "Backup for $currMachineName started"
+    if [ "$OUTPUT_MODE" != "console" ]; then
+        rm -f "$DIR/temp_process_machine.log"
+    fi
     local currMachineData=$(get_machine_by_name "$currMachineName")
     local currMountPath="$DIR/mount/$MOUNT_SHARE_FOLDER_NAME"
     local backupLog="Starting backup log for machine $currMachineName"
     tempLog() {
-         	backupLog+="\n"
-            backupLog+="$(date) $1"
+        local line="$(date) $1"
+        backupLog+="\n$line"
+        if [ "$OUTPUT_MODE" = "console" ]; then
+            printf '%s\n' "$line"
+        fi
     }
-    # Checking that no mounted folder was left by previous backup
-    if [ -d "$currMountPath" ]; then
+    # Checking that no active mount was left by a previous backup. Directory
+    # existence alone is not evidence of a mount: failed mount attempts leave
+    # an ordinary empty mount-point directory behind.
+    if mountpoint -q "$currMountPath"; then
         tempLog "$currMountPath is currently mounted."
         tempLog "Trying to forcefully unmount directory before starting new backup..."
-        sleep 3
-        sudo -n umount -f "$currMountPath"
-        $DIR/unmount_share.sh "$currMountPath"
-        sleep 3
+        sudo -n umount -f "$currMountPath" >/dev/null 2>&1 || true
+        "$DIR/unmount_share.sh" "$currMountPath"
 	fi
 
-    if [ -d "$currMountPath" ]; then
+    if mountpoint -q "$currMountPath"; then
         tempLog "$currMountPath is still mounted."
         tempLog "Unmount previously mounted directory before starting new backup failed."
         exclude_machine_due_to_error "$currMachineData" "$backupLog"
         $DIR/report_error.sh "$currMachineName" "$backupLog"
         return
 	fi
+
+    # Remove an empty directory left by an unsuccessful mount. mount_share.sh
+    # will recreate it with the correct permissions.
+    if [ -d "$currMountPath" ]; then
+        rmdir "$currMountPath" 2>/dev/null || true
+    fi
 
     # Pulling esxi server name for this machine.
     local esxiServerName=$(echo "$currMachineData" | jq -r ".esxiServer")
@@ -435,6 +534,7 @@ process_machine_backup_by_name () {
     # Pulling backup server credentials & aux data for this machine.
     local backupServerData=$(get_backup_server_data_by_name "$backupServerName")
     
+    # sample data: {"name": "DS-218-1-8Tb", "ip": "192.168.1.149", "login": "admin", "password": "Password", "sharePath": "backup1", "mac": "00:11:32:8E:DC:9A", "broadcastIp":"192.168.1.255", "powerOff":"y", "powerOn":"y"},
     local backupServerIp=$(echo $backupServerData | jq -r ".ip")
     local backupServerSharePath=$(echo $backupServerData | jq -r ".sharePath")
     local currSharePath="//$backupServerIp/$backupServerSharePath"
@@ -470,26 +570,42 @@ process_machine_backup_by_name () {
    
     # Trying to power on the backup server
     # passing local mounting point (path), network share, username, password
-    tempLog "Trying to mount $currSharePath ..." 
-    $DIR/mount_share.sh "$currMountPath" "$currSharePath" "$currUserName" "$currPassword"
+    local mountAttempt
+    tempLog "Trying to mount $currSharePath ..."
+    for ((mountAttempt = 1; mountAttempt <= CIFS_MOUNT_ATTEMPTS; mountAttempt++)); do
+        "$DIR/mount_share.sh" "$currMountPath" "$currSharePath" "$currUserName" "$currPassword"
+        if mountpoint -q "$currMountPath"; then
+            break
+        fi
+        if [ "$mountAttempt" -lt "$CIFS_MOUNT_ATTEMPTS" ]; then
+            tempLog "CIFS is not ready after mount attempt $mountAttempt/$CIFS_MOUNT_ATTEMPTS; retrying in $CIFS_MOUNT_RETRY_INTERVAL seconds."
+            "$DIR/unmount_share.sh" "$currMountPath" >/dev/null 2>&1 || true
+            sleep "$CIFS_MOUNT_RETRY_INTERVAL"
+        fi
+    done
 
     if ! mountpoint -q "$currMountPath"; then
 		tempLog "Shared folder $currSharePath on backup server $backupServerName cannot be mounted. Backup aborted." 
+        "$DIR/unmount_share.sh" "$currMountPath" >/dev/null 2>&1 || true
         exclude_machine_due_to_error $(get_machine_by_name "$currMachineName") "$backupLog"
         $DIR/report_error.sh "$currMachineName" "$backupLog"
         return
 	fi
 
     tempLog "$currMountPath seems to be mounted successfully."   
-    $DIR/process_machine.sh "$currMachineData" "$esxiServerData" "$currMountPath" "$TEMP_BACKUP_STORAGE_PATH" "$DIR"
+    "$DIR/process_machine.sh" "$currMachineData" "$esxiServerData" "$currMountPath" "$TEMP_BACKUP_STORAGE_PATH" "$DIR" "$OUTPUT_MODE"
     local backupMachineResult=$?
-    if [ -f "$DIR/temp_process_machine.log" ]; then
+    if [ "$OUTPUT_MODE" != "console" ] && [ -f "$DIR/temp_process_machine.log" ]; then
         backupLog+="\n"
         backupLog+="$(cat "$DIR/temp_process_machine.log")"
         rm "$DIR/temp_process_machine.log"
     fi
 
     if [ "$backupMachineResult" -ne 0 ]; then
+         if [ "$backupMachineResult" -eq "$BACKUP_SKIPPED" ]; then
+             log "Backup for $currMachineName was skipped; its last successful-backup timestamp was not changed"
+             return
+         fi
          tempLog "Backup for $currMachineName failed with exit code $backupMachineResult"
          exclude_machine_due_to_error "$currMachineData" "$backupLog"
          $DIR/report_error.sh "$currMachineName" "$backupLog"
@@ -500,33 +616,106 @@ process_machine_backup_by_name () {
     write_machine_success_log "$(get_machine_by_name "$currMachineName")" "$backupLog"
     log "Backup for $currMachineName completed successfully"
 }
-    
-    while [ 1 ]
-    do
-       timeNow=$(get_current_military_time)
-       pendingBackupsLength=${#pendingBackups[@]}
-       if [ "$timeNow" == "$prefferedBackupStartTime" ] && [ "$pendingBackupsLength" == 0 ]; then
-            log "Backup was triggered according to the preffered backup start time $prefferedBackupStartTime"
-            add_due_for_backup_machines_to_pending_backups_array
-       fi
-       # proceed with backups if any machines were added
-       pendingBackupsLength=${#pendingBackups[@]}
-       if [ "$pendingBackupsLength" != 0 ]; then
-            log "$pendingBackupsLength machines were added for backups."
-          
-             while [ $pendingBackupsLength != 0 ]
-             do
-                currentMachineName="${pendingBackups[0]}"
-                remove_machine_from_pending_backups_array_by_idx 0
-                pendingBackupsLength=${#pendingBackups[@]}
-                process_machine_backup_by_name "$currentMachineName"
-                sleep 10
-                #Unmounting possibly mounted directory for backup destiantion
-                CURR_MOUNT_PATH="$DIR/mount/$MOUNT_SHARE_FOLDER_NAME"
-                $DIR/unmount_share.sh "$CURR_MOUNT_PATH"
-             done
-            log "All machines added for a backup has been processed."
-            power_off_all_flagged_backup_servers
-       fi
-    sleep $MAIN_LOOP_REFRESH_INTERVAL
+
+select_manual_backups() {
+    local machine_count=${#machines[@]}
+    local selection token index
+    local -A selected_indexes=()
+
+    if [ "$machine_count" -eq 0 ]; then
+        echo "No VMs are configured."
+        return 1
+    fi
+    if [ ! -t 0 ]; then
+        echo "Manual mode requires an interactive terminal." >&2
+        return 1
+    fi
+
+    printf '\n%-4s %-28s %-18s %-22s %s\n' "#" "VM" "ESXi server" "Backup server" "Period (hours)"
+    printf '%-4s %-28s %-18s %-22s %s\n' "----" "----------------------------" "------------------" "----------------------" "--------------"
+    for index in "${!machines[@]}"; do
+        printf '%-4d %-28s %-18s %-22s %s\n' \
+            "$((index + 1))" \
+            "$(echo "${machines[$index]}" | jq -r '.name')" \
+            "$(echo "${machines[$index]}" | jq -r '.esxiServer')" \
+            "$(echo "${machines[$index]}" | jq -r '.backupServer')" \
+            "$(echo "${machines[$index]}" | jq -r '.backupPeriod')"
     done
+
+    printf '\nEnter VM numbers separated by commas (or press Enter to cancel): '
+    IFS= read -r selection
+    if [ -z "${selection//[[:space:]]/}" ]; then
+        echo "No VMs selected."
+        return 1
+    fi
+
+    IFS=',' read -ra requested_indexes <<< "$selection"
+    for token in "${requested_indexes[@]}"; do
+        token="${token//[[:space:]]/}"
+        if ! [[ "$token" =~ ^[0-9]+$ ]] || [ "$token" -lt 1 ] || [ "$token" -gt "$machine_count" ]; then
+            echo "Invalid VM number: ${token:-empty}. Nothing was queued." >&2
+            pendingBackups=()
+            return 1
+        fi
+        selected_indexes["$token"]=1
+    done
+
+    for index in "${!machines[@]}"; do
+        if [ "${selected_indexes[$((index + 1))]:-0}" -eq 1 ]; then
+            pendingBackups+=("$(get_machine_name "${machines[$index]}")")
+        fi
+    done
+}
+
+process_pending_backups() {
+    local pendingBackupsLength=${#pendingBackups[@]}
+    if [ "$pendingBackupsLength" -eq 0 ]; then
+        return
+    fi
+
+    log "$pendingBackupsLength machines were added for backups."
+    while [ "$pendingBackupsLength" -ne 0 ]; do
+        local currentMachineName="${pendingBackups[0]}"
+        remove_machine_from_pending_backups_array_by_idx 0
+        pendingBackupsLength=${#pendingBackups[@]}
+        process_machine_backup_by_name "$currentMachineName"
+        sleep 10
+        "$DIR/unmount_share.sh" "$DIR/mount/$MOUNT_SHARE_FOLDER_NAME"
+    done
+    log "All machines added for a backup have been processed."
+    power_off_all_flagged_backup_servers
+}
+
+if [ "$RUN_MODE" = "run-now" ]; then
+    log "Immediate backup check was requested."
+    add_due_for_backup_machines_to_pending_backups_array
+    if [ "${#pendingBackups[@]}" -eq 0 ]; then
+        log "No machines are currently due for backup."
+        exit 0
+    fi
+    process_pending_backups
+    exit 0
+fi
+
+if [ "$RUN_MODE" = "manual" ]; then
+    log "Interactive manual backup was requested."
+    select_manual_backups || exit 0
+    process_pending_backups
+    exit 0
+fi
+
+lastScheduleTrigger=""
+while [ 1 ]; do
+    timeNow=$(get_current_military_time)
+    pendingBackupsLength=${#pendingBackups[@]}
+    scheduleTrigger="$(date +'%Y%m%d%H%M')"
+    if [ "$timeNow" == "$prefferedBackupStartTime" ] && \
+       [ "$pendingBackupsLength" == 0 ] && \
+       [ "$scheduleTrigger" != "$lastScheduleTrigger" ]; then
+        lastScheduleTrigger="$scheduleTrigger"
+        log "Backup was triggered according to the preffered backup start time $prefferedBackupStartTime"
+        add_due_for_backup_machines_to_pending_backups_array
+    fi
+    process_pending_backups
+    sleep "$MAIN_LOOP_REFRESH_INTERVAL"
+done

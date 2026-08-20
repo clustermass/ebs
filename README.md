@@ -27,28 +27,35 @@ review notes.
   minute causes the day's trigger to be missed.
 - A failed VM is excluded until an operator investigates and removes its error
   file; there is no automatic retry policy.
-- A suspended VM skipped with `suppressErrorIfSuspended: "y"` is currently
-  recorded as successful even though no export was created.
+- A suspended VM skipped with `suppressErrorIfSuspended: "y"` remains due, but
+  it is reconsidered only at the next scheduled trigger—not immediately when
+  the VM is resumed.
 - `report_error.sh` is a placeholder. There are no built-in email, webhook, or
   centralized monitoring notifications.
 - Compatibility has been tested with specific ESXi, DSM, and OVF Tool versions
   documented in `INSTALLATION.md`; other versions require validation.
+- Attached CD/DVD or floppy media must remain accessible to ESXi during export.
+  Disconnect stale ISO or device mappings that OVF Tool cannot read.
 - Restoration must be tested independently. A completed export is not proof of
   a recoverable backup.
 
 ## Capabilities
 
 - Schedule backups at a preferred daily start time.
+- Run the normal due-VM check immediately with `--run-now`.
+- Select specific VMs interactively with `-m` and stream detailed output.
 - Give each VM an independent backup interval, in hours.
 - Manage multiple ESXi hosts and NAS shares from one configuration.
 - Wake and optionally shut down Synology NAS devices.
 - Mount CIFS destinations only while they are needed.
+- Retry CIFS mounting while a newly started NAS finishes initializing SMB.
 - Gracefully stop VMs, with a hard power-off fallback when VMware Tools fails.
 - Export complete VMs in OVF format with a locally installed VMware OVF Tool.
 - Stage exports locally or directly on the NAS.
 - Restore a VM to its original powered-on state.
 - Keep the last stable backup if export or VM restart fails.
 - Record successful and failed backup history.
+- Prevent overlapping scheduled and manual coordinators with an instance lock.
 
 ## Backup lifecycle
 
@@ -57,7 +64,8 @@ elapsed and processes them sequentially:
 
 1. Confirm that the ESXi host is reachable.
 2. Wake the configured NAS when `powerOn` is enabled.
-3. Mount its CIFS share at `mount/backupDestination`.
+3. Mount its CIFS share at `mount/backupDestination`, retrying up to five times
+   at 30-second intervals while SMB becomes ready.
 4. Find the VM and record its initial power state.
 5. Stop the VM if it is running.
 6. Export it to a staging directory named `___VM_NAME`.
@@ -67,14 +75,37 @@ elapsed and processes them sequentially:
 10. Record the result, unmount the share, and continue.
 
 The old stable backup is removed only after the new export exists and a VM that
-was originally running has restarted successfully.
+was originally running has restarted successfully. After the original power
+state is known, failures or interruptions in later stages attempt to restore a
+VM that began powered on.
+
+## Operational gotchas
+
+- Remove unneeded ISO/floppy backing from virtual CD/DVD and floppy devices
+  before export. A device shown as disconnected may still cause OVF Tool to
+  retrieve its backing image; an inaccessible image produces errors such as
+  `Failed to open file stream: .../VM-0.iso`. Behavior can differ by ESXi
+  version.
+- A Synology NAS may answer ping before DSM's SMB service is ready. EBS retries
+  CIFS mounting five times with a 30-second interval; very slow systems may
+  require larger `CIFS_MOUNT_ATTEMPTS` or `CIFS_MOUNT_RETRY_INTERVAL` values in
+  `ebs.sh`.
+- ESXi exposes separate SSH host keys for different algorithms. After an ESXi
+  upgrade, reinstall, SSH change, or configuration replacement, verify keys
+  again with `setup_utils/update_esxi_host_keys.sh`, then run
+  `setup_utils/test_esxi_servers.sh`.
+- Stop `ebs.service` before using `--run-now` or `-m`; the service owns
+  `process.lock` while running.
+- A failed VM stays excluded until its exact file under `excluded_machines` is
+  reviewed and removed.
 
 ## Requirements
 
 EBS targets Linux with Bash and systemd. It uses:
 
 - Bundled `jq` (`bin/jq-linux64`)
-- VMware OVF Tool, installed separately under VMware/Broadcom's license
+- VMware OVF Tool, installed separately at `bin/ovftool/ovftool` under
+  VMware/Broadcom's license
 - `plink` from `putty-tools`
 - OpenSSH (`ssh`, `ssh-keyscan`, and `ssh-keygen`)
 - `sshpass` and `wakeonlan`
@@ -145,7 +176,9 @@ Configuration notes:
 - `esxiServer` and `backupServer` refer to matching `name` fields.
 - `useTempBackupStorage: "y"` exports locally before moving to the NAS. The
   temporary path needs space for a complete VM.
-- `suppressErrorIfSuspended: "y"` silently skips suspended VMs.
+- `suppressErrorIfSuspended: "y"` skips suspended VMs without changing their
+  last successful-backup timestamp or excluding them. They remain due for the
+  next scheduled trigger. With `"n"`, suspension is recorded as a failure.
 - Multiple logical shares may use one NAS IP; shutdown is deduplicated by IP.
 - Generate one `esxiHostKey` with
   `./setup_utils/get_server_signature.sh ESXI_HOST`. Verify the
@@ -167,8 +200,8 @@ credentials.
    bash setup_utils/setup_permissions.sh
    ```
 
-6. Install VMware OVF Tool either at `bin/ovftool/ovftool` or on `PATH`, and
-   confirm that it runs on the target host.
+6. Install VMware OVF Tool at `bin/ovftool/ovftool`, and confirm that it runs on
+   the target host.
 7. Install the path-aware systemd unit and scoped CIFS permissions, then start
    the service:
 
@@ -188,6 +221,48 @@ credentials.
 EBS reads `config.json` relative to its working directory. Bundled executable
 paths are resolved from the EBS installation directory.
 
+## Running backups
+
+The systemd service runs `ebs.sh` without options. It remains active, checks the
+server's local time, and starts all due VMs at `prefferedBackupStartTime`.
+
+To perform the same due-machine check immediately instead of waiting for that
+time, stop the continuously running service, use `--run-now`, and start the
+service again:
+
+```bash
+sudo systemctl stop ebs.service
+./ebs.sh --run-now
+sudo systemctl start ebs.service
+```
+
+`--run-now` processes only VMs whose `backupPeriod` has elapsed, exactly as the
+scheduled trigger does. Normal coordinator and per-machine logs are retained.
+
+For an interactive backup, use manual mode:
+
+```bash
+sudo systemctl stop ebs.service
+./ebs.sh -m
+sudo systemctl start ebs.service
+```
+
+Manual mode prints a numbered table of every configured VM. Enter one or more
+numbers separated by commas, such as `1,4,5,17`. The selected VMs are processed
+immediately regardless of their configured interval or exclusion status.
+Coordinator and detailed machine output is streamed to the terminal instead of
+`ebs.log` and `temp_process_machine.log`. Successful and failed results still
+update `processed_machines` and `excluded_machines`, because those files are
+scheduler and safety state.
+
+Only one EBS coordinator may run at a time. Every mode atomically creates
+`process.lock` with its PID, start epoch, and mode. A graceful exit or systemd
+stop removes it; the unit's `ExecStopPost` also removes a leftover lock after
+the service terminates. If EBS finds a lock owned by a live process, it exits
+without starting a backup; a lock belonging to a dead PID is identified and
+removed as stale. The running systemd service therefore must be stopped before
+either one-shot command is used.
+
 ## Runtime state and recovery
 
 - `processed_machines/VM_NAME.log` begins with the epoch time of the latest
@@ -195,8 +270,11 @@ paths are resolved from the EBS installation directory.
 - `excluded_machines/VM_NAME.err` records a failure and prevents that VM from
   being scheduled again.
 - `ebs.log` contains coordinator activity.
-- `temp_process_machine.log` temporarily carries detailed worker output.
+- `temp_process_machine.log` temporarily carries detailed worker output during
+  scheduled and `--run-now` processing; `-m` streams that output directly.
 - `mount/backupDestination` is the transient CIFS mount point.
+- `process.lock` identifies the active EBS coordinator and prevents overlapping
+  scheduled or manually initiated backup runs.
 
 After correcting a failure, explicitly re-enable that VM by removing only its
 error file:
@@ -209,9 +287,12 @@ There is currently no automatic retry or expiry for excluded machines.
 
 ## File map
 
-- `ebs.sh` — scheduler and coordinator.
-- `process_machine.sh` — VM shutdown, OVF export, restore, and promotion.
-- `mount_share.sh` / `unmount_share.sh` — active CIFS handling.
+- `ebs.sh` — scheduler, immediate/manual entry points, instance lock, and
+  coordinator.
+- `process_machine.sh` — VM shutdown, OVF export, restore, promotion, and
+  file/console output handling.
+- `mount_share.sh` / `unmount_share.sh` — active and idempotent CIFS handling;
+  the coordinator retries mounts while DSM finishes starting SMB.
 - `power_on_synology.sh` / `power_off_synology.sh` — NAS power management.
 - `setup_utils/get_server_signature.sh` — obtains one fingerprint for `plink`.
 - `setup_utils/update_esxi_host_keys.sh` — verifies and saves fingerprints for

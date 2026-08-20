@@ -23,6 +23,7 @@ FILES=(
   "setup_utils/test_nas_power.sh"
   "setup_utils/install_systemd_service.sh"
   "bin/jq-linux64"
+  "bin/ovftool/ovftool"
 )
 
 echo "Setting executable bit on EBS files in: $PROJECT_DIR"
